@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# MalCheck - マルウェアチェックスクリプト
+# MalCheck - マルウェアチェックスクリプト（高速版）
 # 使用方法: ./malcheck.sh <検索パス> <npmパッケージリストファイル>
 
 set -e
@@ -44,7 +44,11 @@ echo ""
 
 # 検出カウンター（一時ファイルを使用してサブシェル問題を回避）
 TEMP_COUNT_FILE=$(mktemp)
+TEMP_RESULT_FILE=$(mktemp)
 echo "0" > "$TEMP_COUNT_FILE"
+
+# クリーンアップ用のトラップ
+trap "rm -f $TEMP_COUNT_FILE $TEMP_RESULT_FILE" EXIT
 
 # =====================================================
 # チェック1: package.jsonファイル内の疑わしいnpmパッケージ
@@ -52,40 +56,51 @@ echo "0" > "$TEMP_COUNT_FILE"
 echo -e "${BLUE}[チェック1] package.jsonファイルの検査${NC}"
 echo "---------------------------------------------------"
 
-# package.jsonファイルを検索
-PACKAGE_JSON_FILES=$(find "$SEARCH_PATH" -type f -name "package.json" 2>/dev/null)
+# 疑わしいパッケージリストを配列に読み込む（空行とコメントを除外）
+SUSPICIOUS_PACKAGES=()
+while IFS= read -r line || [ -n "$line" ]; do
+    # 空行とコメント行をスキップ
+    if [ -z "$line" ] || [[ "$line" =~ ^[[:space:]]*# ]]; then
+        continue
+    fi
+    # 前後の空白を削除して配列に追加
+    line=$(echo "$line" | xargs)
+    if [ -n "$line" ]; then
+        SUSPICIOUS_PACKAGES+=("$line")
+    fi
+done < "$PACKAGE_LIST_FILE"
 
-if [ -z "$PACKAGE_JSON_FILES" ]; then
+# package.jsonファイルを検索
+mapfile -t PACKAGE_JSON_ARRAY < <(find "$SEARCH_PATH" -type f -name "package.json" 2>/dev/null)
+
+if [ ${#PACKAGE_JSON_ARRAY[@]} -eq 0 ]; then
     echo -e "${GREEN}✓ package.jsonファイルが見つかりませんでした${NC}"
 else
-    PACKAGE_JSON_COUNT=$(echo "$PACKAGE_JSON_FILES" | wc -l)
+    PACKAGE_JSON_COUNT=${#PACKAGE_JSON_ARRAY[@]}
     echo -e "見つかったpackage.jsonファイル数: ${YELLOW}$PACKAGE_JSON_COUNT${NC}"
     echo ""
     
-    # 疑わしいパッケージリストを読み込む
-    while IFS= read -r SUSPICIOUS_PACKAGE || [ -n "$SUSPICIOUS_PACKAGE" ]; do
-        # 空行とコメント行をスキップ
-        if [ -z "$SUSPICIOUS_PACKAGE" ] || [[ "$SUSPICIOUS_PACKAGE" =~ ^[[:space:]]*# ]]; then
-            continue
+    # 最適化：各ファイルを1回だけ読んで全パッケージをチェック
+    for PKG_FILE in "${PACKAGE_JSON_ARRAY[@]}"; do
+        # ファイル内容を一度だけ読み込む
+        if [ -f "$PKG_FILE" ]; then
+            PKG_CONTENT=$(cat "$PKG_FILE" 2>/dev/null || echo "")
+            
+            # 全ての疑わしいパッケージをチェック
+            for SUSPICIOUS_PACKAGE in "${SUSPICIOUS_PACKAGES[@]}"; do
+                # パッケージ名を検索（エスケープして安全に）
+                if echo "$PKG_CONTENT" | grep -q "\"$SUSPICIOUS_PACKAGE\"" 2>/dev/null; then
+                    echo -e "${RED}[警告] 疑わしいパッケージが検出されました！${NC}"
+                    echo -e "  ファイル: ${YELLOW}$PKG_FILE${NC}"
+                    echo -e "  パッケージ: ${RED}$SUSPICIOUS_PACKAGE${NC}"
+                    echo ""
+                    # カウントを増やす
+                    CURRENT_COUNT=$(cat "$TEMP_COUNT_FILE")
+                    echo $((CURRENT_COUNT + 1)) > "$TEMP_COUNT_FILE"
+                fi
+            done
         fi
-        
-        # 前後の空白を削除
-        SUSPICIOUS_PACKAGE=$(echo "$SUSPICIOUS_PACKAGE" | xargs)
-        
-        # 各package.jsonファイルをチェック
-        while IFS= read -r PKG_FILE; do
-            # package.json内でパッケージを検索
-            if grep -q "\"$SUSPICIOUS_PACKAGE\"" "$PKG_FILE" 2>/dev/null; then
-                echo -e "${RED}[警告] 疑わしいパッケージが検出されました！${NC}"
-                echo -e "  ファイル: ${YELLOW}$PKG_FILE${NC}"
-                echo -e "  パッケージ: ${RED}$SUSPICIOUS_PACKAGE${NC}"
-                echo ""
-                # カウントを増やす
-                CURRENT_COUNT=$(cat "$TEMP_COUNT_FILE")
-                echo $((CURRENT_COUNT + 1)) > "$TEMP_COUNT_FILE"
-            fi
-        done <<< "$PACKAGE_JSON_FILES"
-    done < "$PACKAGE_LIST_FILE"
+    done
 fi
 
 echo ""
@@ -103,28 +118,55 @@ SUSPICIOUS_ITEMS=(
     ".dev-env"
 )
 
-for ITEM in "${SUSPICIOUS_ITEMS[@]}"; do
-    # ファイルまたはディレクトリを検索
-    FOUND_ITEMS=$(find "$SEARCH_PATH" -name "$ITEM" 2>/dev/null)
-    
-    if [ -n "$FOUND_ITEMS" ]; then
-        echo -e "${RED}[警告] 疑わしいアイテムが検出されました！${NC}"
-        echo -e "  名前: ${RED}$ITEM${NC}"
-        while IFS= read -r FOUND_PATH; do
-            if [ -d "$FOUND_PATH" ]; then
-                echo -e "  場所: ${YELLOW}$FOUND_PATH${NC} ${RED}(ディレクトリ)${NC}"
-            else
-                echo -e "  場所: ${YELLOW}$FOUND_PATH${NC} ${RED}(ファイル)${NC}"
-            fi
-            # カウントを増やす
-            CURRENT_COUNT=$(cat "$TEMP_COUNT_FILE")
-            echo $((CURRENT_COUNT + 1)) > "$TEMP_COUNT_FILE"
-        done <<< "$FOUND_ITEMS"
-        echo ""
+# 最適化：1回のfindで全アイテムを検索
+FIND_EXPR=()
+for i in "${!SUSPICIOUS_ITEMS[@]}"; do
+    if [ $i -eq 0 ]; then
+        FIND_EXPR+=("-name" "${SUSPICIOUS_ITEMS[$i]}")
     else
-        echo -e "${GREEN}✓ '$ITEM' は見つかりませんでした${NC}"
+        FIND_EXPR+=("-o" "-name" "${SUSPICIOUS_ITEMS[$i]}")
     fi
 done
+
+# 全ての疑わしいアイテムを一度に検索
+if [ ${#FIND_EXPR[@]} -gt 0 ]; then
+    mapfile -t FOUND_ITEMS_ARRAY < <(find "$SEARCH_PATH" \( "${FIND_EXPR[@]}" \) 2>/dev/null)
+    
+    # 各疑わしいアイテムに対して結果を整理して表示
+    for ITEM in "${SUSPICIOUS_ITEMS[@]}"; do
+        ITEM_FOUND=false
+        for FOUND_PATH in "${FOUND_ITEMS_ARRAY[@]}"; do
+            BASENAME=$(basename "$FOUND_PATH")
+            if [ "$BASENAME" = "$ITEM" ]; then
+                if [ "$ITEM_FOUND" = false ]; then
+                    echo -e "${RED}[警告] 疑わしいアイテムが検出されました！${NC}"
+                    echo -e "  名前: ${RED}$ITEM${NC}"
+                    ITEM_FOUND=true
+                fi
+                
+                if [ -d "$FOUND_PATH" ]; then
+                    echo -e "  場所: ${YELLOW}$FOUND_PATH${NC} ${RED}(ディレクトリ)${NC}"
+                else
+                    echo -e "  場所: ${YELLOW}$FOUND_PATH${NC} ${RED}(ファイル)${NC}"
+                fi
+                
+                # カウントを増やす
+                CURRENT_COUNT=$(cat "$TEMP_COUNT_FILE")
+                echo $((CURRENT_COUNT + 1)) > "$TEMP_COUNT_FILE"
+            fi
+        done
+        
+        if [ "$ITEM_FOUND" = true ]; then
+            echo ""
+        else
+            echo -e "${GREEN}✓ '$ITEM' は見つかりませんでした${NC}"
+        fi
+    done
+else
+    for ITEM in "${SUSPICIOUS_ITEMS[@]}"; do
+        echo -e "${GREEN}✓ '$ITEM' は見つかりませんでした${NC}"
+    done
+fi
 
 echo ""
 
@@ -137,7 +179,6 @@ echo -e "${BLUE}================================================${NC}"
 
 # 最終カウントを取得
 MALWARE_COUNT=$(cat "$TEMP_COUNT_FILE")
-rm -f "$TEMP_COUNT_FILE"
 
 if [ $MALWARE_COUNT -eq 0 ]; then
     echo -e "${GREEN}✓ マルウェアや疑わしいファイルは検出されませんでした${NC}"
