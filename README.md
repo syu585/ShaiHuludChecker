@@ -32,27 +32,40 @@
 ### 基本的な使い方
 
 ```bash
-./malcheck.sh <検索パス> <npmパッケージリストファイル>
+./malcheck.sh <検索パス> [npmパッケージリストファイル]
 ```
 
 ### パラメータ
 
 - **第1パラメータ**: 検索したいパス（必須）
-- **第2パラメータ**: 疑わしいnpmパッケージのリストファイル（必須）
-  - デフォルトでは`AffectedPackages.txt`を使用
+- **第2パラメータ**: 疑わしいnpmパッケージのリストファイル（省略可能）
+  - 省略した場合、自動的にオンラインから最新のマルウェアDBをダウンロード
+  - 指定した場合、そのローカルファイルを使用
+  - オフライン時は`AffectedPackages.txt`をフォールバックとして使用
 
 ### 例
 
 ```bash
-# カレントディレクトリをチェック
+# カレントディレクトリをチェック（最新DBを自動取得）
+./malcheck.sh .
+
+# 特定のプロジェクトディレクトリをチェック（最新DBを自動取得）
+./malcheck.sh /path/to/project
+
+# ホームディレクトリ全体をチェック（最新DBを自動取得）
+./malcheck.sh ~
+
+# ローカルファイルを明示的に指定してチェック
 ./malcheck.sh . AffectedPackages.txt
-
-# 特定のプロジェクトディレクトリをチェック
-./malcheck.sh /path/to/project AffectedPackages.txt
-
-# ホームディレクトリ全体をチェック
-./malcheck.sh ~ AffectedPackages.txt
 ```
+
+### 自動更新機能
+
+- マルウェアDBは24時間ごとに自動更新されます
+- キャッシュは`$HOME/.malcheck_cache/`に保存されます
+- オンライン取得に失敗した場合、以下の順でフォールバックします：
+  1. 古いキャッシュファイル（存在する場合）
+  2. ローカルの`AffectedPackages.txt`ファイル
 
 ## パッケージリストファイルの形式
 
@@ -66,7 +79,7 @@ posthog-node
 kill-port
 ```
 
-このファイルには現在492個の既知のマルウェアパッケージがリストされています。
+オンライン版では最新の脅威情報が含まれています。ローカルの`AffectedPackages.txt`には現在797個の既知のマルウェアパッケージがリストされています。
 
 ## 出力結果
 
@@ -101,6 +114,10 @@ nano AffectedPackages.txt
 
 4. スクリプトを実行：
 ```bash
+# 最新DBを自動取得してチェック（推奨）
+./malcheck.sh /path/to/check
+
+# またはローカルファイルを指定
 ./malcheck.sh /path/to/check AffectedPackages.txt
 ```
 
@@ -109,13 +126,14 @@ nano AffectedPackages.txt
 - Bash 4.0以上
 - `find`コマンド
 - `grep`コマンド
+- `curl`または`wget`（オンライン更新機能を使用する場合）
 
 ## 注意事項
 
 - このスクリプトは読み取り専用で、ファイルを変更・削除することはありません
 - 大規模なディレクトリをスキャンする場合、時間がかかることがあります
-- 定期的に`AffectedPackages.txt`を最新の脅威情報で更新することを推奨します
-- `AffectedPackages.txt`には現在492個の既知のマルウェアパッケージが含まれています
+- オンライン更新機能を使用する場合、マルウェアDBは24時間ごとに自動更新されます
+- オフライン環境では定期的に`AffectedPackages.txt`を手動更新することを推奨します
 
 ## ライセンス
 
