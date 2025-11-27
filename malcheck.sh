@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# MalCheck - マルウェアチェックスクリプト（高速版）
+# MalCheck - マルウェアチェックスクリプト（高速版・バージョンチェック対応）
 # 使用方法: ./malcheck.sh <検索パス> <npmパッケージリストファイル>
 
 set -e
@@ -53,22 +53,37 @@ trap "rm -f $TEMP_COUNT_FILE $TEMP_RESULT_FILE" EXIT
 # =====================================================
 # チェック1: package.jsonファイル内の疑わしいnpmパッケージ
 # =====================================================
-echo -e "${BLUE}[チェック1] package.jsonファイルの検査${NC}"
+echo -e "${BLUE}[チェック1] package.jsonファイルの検査（バージョンチェック対応）${NC}"
 echo "---------------------------------------------------"
 
-# 疑わしいパッケージリストを配列に読み込む（空行とコメントを除外）
-SUSPICIOUS_PACKAGES=()
+# 疑わしいパッケージリストを連想配列に読み込む（パッケージ名 -> バージョン）
+declare -A SUSPICIOUS_PACKAGES_MAP
+SUSPICIOUS_PACKAGES_NAMES=()
+
+line_num=0
 while IFS= read -r line || [ -n "$line" ]; do
-    # 空行とコメント行をスキップ
-    if [ -z "$line" ] || [[ "$line" =~ ^[[:space:]]*# ]]; then
+    line_num=$((line_num + 1))
+    
+    # ヘッダー行、空行、コメント行をスキップ
+    if [ $line_num -eq 1 ] || [ -z "$line" ] || [[ "$line" =~ ^[[:space:]]*# ]]; then
         continue
     fi
-    # 前後の空白を削除して配列に追加
-    line=$(echo "$line" | xargs)
-    if [ -n "$line" ]; then
-        SUSPICIOUS_PACKAGES+=("$line")
+    
+    # CSV形式をパース（パッケージ名,バージョン）
+    IFS=',' read -r package_name version_spec <<< "$line"
+    
+    # 前後の空白を削除
+    package_name=$(echo "$package_name" | xargs)
+    version_spec=$(echo "$version_spec" | xargs)
+    
+    if [ -n "$package_name" ]; then
+        SUSPICIOUS_PACKAGES_MAP["$package_name"]="$version_spec"
+        SUSPICIOUS_PACKAGES_NAMES+=("$package_name")
     fi
 done < "$PACKAGE_LIST_FILE"
+
+echo -e "読み込まれた疑わしいパッケージ数: ${YELLOW}${#SUSPICIOUS_PACKAGES_NAMES[@]}${NC}"
+echo ""
 
 # package.jsonファイルを検索
 mapfile -t PACKAGE_JSON_ARRAY < <(find "$SEARCH_PATH" -type f -name "package.json" 2>/dev/null)
@@ -87,16 +102,60 @@ else
             PKG_CONTENT=$(cat "$PKG_FILE" 2>/dev/null || echo "")
             
             # 全ての疑わしいパッケージをチェック
-            for SUSPICIOUS_PACKAGE in "${SUSPICIOUS_PACKAGES[@]}"; do
-                # パッケージ名を検索（エスケープして安全に）
-                if echo "$PKG_CONTENT" | grep -q "\"$SUSPICIOUS_PACKAGE\"" 2>/dev/null; then
-                    echo -e "${RED}[警告] 疑わしいパッケージが検出されました！${NC}"
-                    echo -e "  ファイル: ${YELLOW}$PKG_FILE${NC}"
-                    echo -e "  パッケージ: ${RED}$SUSPICIOUS_PACKAGE${NC}"
-                    echo ""
-                    # カウントを増やす
-                    CURRENT_COUNT=$(cat "$TEMP_COUNT_FILE")
-                    echo $((CURRENT_COUNT + 1)) > "$TEMP_COUNT_FILE"
+            for PACKAGE_NAME in "${SUSPICIOUS_PACKAGES_NAMES[@]}"; do
+                # パッケージ名を検索
+                if echo "$PKG_CONTENT" | grep -q "\"$PACKAGE_NAME\"" 2>/dev/null; then
+                    # パッケージが見つかったので、バージョンを抽出
+                    VERSION_IN_FILE=$(echo "$PKG_CONTENT" | grep -o "\"$PACKAGE_NAME\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed 's/.*"[^"]*"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/' | head -n 1)
+                    
+                    # 疑わしいバージョン仕様を取得
+                    VERSION_SPEC="${SUSPICIOUS_PACKAGES_MAP[$PACKAGE_NAME]}"
+                    
+                    # バージョンチェック
+                    IS_SUSPICIOUS=false
+                    
+                    if [ -z "$VERSION_SPEC" ]; then
+                        # バージョン指定がない場合は、パッケージ名のみで判定
+                        IS_SUSPICIOUS=true
+                    else
+                        # バージョン仕様を解析（|| で区切られた複数バージョンに対応）
+                        IFS='||' read -ra VERSION_PARTS <<< "$VERSION_SPEC"
+                        for VERSION_PART in "${VERSION_PARTS[@]}"; do
+                            # 前後の空白と "= " を削除
+                            VERSION_PART=$(echo "$VERSION_PART" | xargs | sed 's/^=[[:space:]]*//')
+                            
+                            # バージョンが一致するかチェック（^や~などの範囲指定も考慮）
+                            if [ -n "$VERSION_IN_FILE" ]; then
+                                # 完全一致チェック
+                                if [[ "$VERSION_IN_FILE" == "$VERSION_PART" ]]; then
+                                    IS_SUSPICIOUS=true
+                                    break
+                                fi
+                                # ^や~を除去して基本バージョンで比較
+                                CLEAN_VERSION=$(echo "$VERSION_IN_FILE" | sed 's/^[\^~]//')
+                                if [[ "$CLEAN_VERSION" == "$VERSION_PART" ]]; then
+                                    IS_SUSPICIOUS=true
+                                    break
+                                fi
+                            fi
+                        done
+                    fi
+                    
+                    if [ "$IS_SUSPICIOUS" = true ]; then
+                        echo -e "${RED}[警告] 疑わしいパッケージが検出されました！${NC}"
+                        echo -e "  ファイル: ${YELLOW}$PKG_FILE${NC}"
+                        echo -e "  パッケージ: ${RED}$PACKAGE_NAME${NC}"
+                        if [ -n "$VERSION_IN_FILE" ]; then
+                            echo -e "  検出バージョン: ${RED}$VERSION_IN_FILE${NC}"
+                        fi
+                        if [ -n "$VERSION_SPEC" ]; then
+                            echo -e "  疑わしいバージョン: ${RED}$VERSION_SPEC${NC}"
+                        fi
+                        echo ""
+                        # カウントを増やす
+                        CURRENT_COUNT=$(cat "$TEMP_COUNT_FILE")
+                        echo $((CURRENT_COUNT + 1)) > "$TEMP_COUNT_FILE"
+                    fi
                 fi
             done
         fi

@@ -9,6 +9,7 @@
 ## 感染されたnpm packageのリスト
 
 - https://www.aikido.dev/blog/shai-hulud-strikes-again-hitting-zapier-ensdomains 
+- https://github.com/wiz-sec-public/wiz-research-iocs/blob/main/reports/shai-hulud-2-packages.csv
 
 ## 機能
 
