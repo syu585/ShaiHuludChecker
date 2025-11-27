@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# MalCheck - マルウェアチェックスクリプト（高速版・バージョンチェック対応）
+# MalCheck - マルウェアチェックスクリプト（最適化版・バージョンチェック対応）
 # 使用方法: ./malcheck.sh <検索パス> <npmパッケージリストファイル>
 
 set -e
@@ -42,13 +42,18 @@ echo -e "検索パス: ${YELLOW}$SEARCH_PATH${NC}"
 echo -e "パッケージリスト: ${YELLOW}$PACKAGE_LIST_FILE${NC}"
 echo ""
 
-# 検出カウンター（一時ファイルを使用してサブシェル問題を回避）
-TEMP_COUNT_FILE=$(mktemp)
-TEMP_RESULT_FILE=$(mktemp)
-echo "0" > "$TEMP_COUNT_FILE"
+# 検出カウンター（変数を使用 - ファイルI/O削減）
+MALWARE_COUNT=0
 
-# クリーンアップ用のトラップ
-trap "rm -f $TEMP_COUNT_FILE $TEMP_RESULT_FILE" EXIT
+# 空白削除用のヘルパー関数（xargsの代わり）
+trim_whitespace() {
+    local var="$1"
+    # 先頭の空白を削除
+    var="${var#"${var%%[![:space:]]*}"}"
+    # 末尾の空白を削除
+    var="${var%"${var##*[![:space:]]}"}"
+    echo "$var"
+}
 
 # =====================================================
 # チェック1: package.jsonファイル内の疑わしいnpmパッケージ
@@ -72,9 +77,9 @@ while IFS= read -r line || [ -n "$line" ]; do
     # CSV形式をパース（パッケージ名,バージョン）
     IFS=',' read -r package_name version_spec <<< "$line"
     
-    # 前後の空白を削除
-    package_name=$(echo "$package_name" | xargs)
-    version_spec=$(echo "$version_spec" | xargs)
+    # 前後の空白を削除（最適化：xargsの代わりにBashネイティブ機能を使用）
+    package_name=$(trim_whitespace "$package_name")
+    version_spec=$(trim_whitespace "$version_spec")
     
     if [ -n "$package_name" ]; then
         SUSPICIOUS_PACKAGES_MAP["$package_name"]="$version_spec"
@@ -103,10 +108,9 @@ else
             
             # 全ての疑わしいパッケージをチェック
             for PACKAGE_NAME in "${SUSPICIOUS_PACKAGES_NAMES[@]}"; do
-                # パッケージ名を検索
-                if echo "$PKG_CONTENT" | grep -q "\"$PACKAGE_NAME\"" 2>/dev/null; then
-                    # パッケージが見つかったので、バージョンを抽出
-                    VERSION_IN_FILE=$(echo "$PKG_CONTENT" | grep -o "\"$PACKAGE_NAME\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed 's/.*"[^"]*"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/' | head -n 1)
+                # 最適化：正規表現マッチングを使用（grep/sed/pipeの代わり）
+                if [[ "$PKG_CONTENT" =~ \"$PACKAGE_NAME\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+                    VERSION_IN_FILE="${BASH_REMATCH[1]}"
                     
                     # 疑わしいバージョン仕様を取得
                     VERSION_SPEC="${SUSPICIOUS_PACKAGES_MAP[$PACKAGE_NAME]}"
@@ -121,19 +125,18 @@ else
                         # バージョン仕様を解析（|| で区切られた複数バージョンに対応）
                         IFS='||' read -ra VERSION_PARTS <<< "$VERSION_SPEC"
                         for VERSION_PART in "${VERSION_PARTS[@]}"; do
-                            # 前後の空白と "= " を削除
-                            VERSION_PART=$(echo "$VERSION_PART" | xargs | sed 's/^=[[:space:]]*//')
+                            # 前後の空白と "= " を削除（最適化版）
+                            VERSION_PART=$(trim_whitespace "$VERSION_PART")
+                            VERSION_PART="${VERSION_PART#=}"
+                            VERSION_PART=$(trim_whitespace "$VERSION_PART")
                             
                             # バージョンが一致するかチェック（^や~などの範囲指定も考慮）
                             if [ -n "$VERSION_IN_FILE" ]; then
-                                # 完全一致チェック
-                                if [[ "$VERSION_IN_FILE" == "$VERSION_PART" ]]; then
-                                    IS_SUSPICIOUS=true
-                                    break
-                                fi
-                                # ^や~を除去して基本バージョンで比較
-                                CLEAN_VERSION=$(echo "$VERSION_IN_FILE" | sed 's/^[\^~]//')
-                                if [[ "$CLEAN_VERSION" == "$VERSION_PART" ]]; then
+                                # 最適化：1回の正規化で処理
+                                CLEAN_VERSION="${VERSION_IN_FILE#[~^]}"
+                                CLEAN_PART="${VERSION_PART#[~^]}"
+                                
+                                if [[ "$VERSION_IN_FILE" == "$VERSION_PART" ]] || [[ "$CLEAN_VERSION" == "$CLEAN_PART" ]]; then
                                     IS_SUSPICIOUS=true
                                     break
                                 fi
@@ -152,9 +155,8 @@ else
                             echo -e "  疑わしいバージョン: ${RED}$VERSION_SPEC${NC}"
                         fi
                         echo ""
-                        # カウントを増やす
-                        CURRENT_COUNT=$(cat "$TEMP_COUNT_FILE")
-                        echo $((CURRENT_COUNT + 1)) > "$TEMP_COUNT_FILE"
+                        # カウントを増やす（最適化：ファイルI/Oの代わりに変数を使用）
+                        ((MALWARE_COUNT++))
                     fi
                 fi
             done
@@ -209,9 +211,8 @@ if [ ${#FIND_EXPR[@]} -gt 0 ]; then
                     echo -e "  場所: ${YELLOW}$FOUND_PATH${NC} ${RED}(ファイル)${NC}"
                 fi
                 
-                # カウントを増やす
-                CURRENT_COUNT=$(cat "$TEMP_COUNT_FILE")
-                echo $((CURRENT_COUNT + 1)) > "$TEMP_COUNT_FILE"
+                # カウントを増やす（最適化：変数を使用）
+                ((MALWARE_COUNT++))
             fi
         done
         
@@ -236,9 +237,7 @@ echo -e "${BLUE}================================================${NC}"
 echo -e "${BLUE}    検査結果${NC}"
 echo -e "${BLUE}================================================${NC}"
 
-# 最終カウントを取得
-MALWARE_COUNT=$(cat "$TEMP_COUNT_FILE")
-
+# 最終カウントを取得（最適化：変数を直接使用）
 if [ $MALWARE_COUNT -eq 0 ]; then
     echo -e "${GREEN}✓ マルウェアや疑わしいファイルは検出されませんでした${NC}"
     echo -e "${GREEN}✓ システムは安全です${NC}"
@@ -248,4 +247,3 @@ else
     echo -e "${RED}⚠ 詳細を確認し、必要に応じて対処してください${NC}"
     exit 1
 fi
-
