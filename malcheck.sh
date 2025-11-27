@@ -136,10 +136,44 @@ trim_whitespace() {
     echo "$var"
 }
 
+# バージョンチェック共通関数
+check_suspicious_version() {
+    local package_name="$1"
+    local version_in_file="$2"
+    local version_spec="$3"
+    
+    if [ -z "$version_spec" ]; then
+        # バージョン指定がない場合は、パッケージ名のみで判定
+        return 0  # true (suspicious)
+    else
+        # バージョン仕様を解析（|| で区切られた複数バージョンに対応）
+        IFS='||' read -ra VERSION_PARTS <<< "$version_spec"
+        for VERSION_PART in "${VERSION_PARTS[@]}"; do
+            # 前後の空白と "= " を削除
+            VERSION_PART=$(trim_whitespace "$VERSION_PART")
+            VERSION_PART="${VERSION_PART#=}"
+            VERSION_PART=$(trim_whitespace "$VERSION_PART")
+            
+            # バージョンが一致するかチェック（^や~などの範囲指定も考慮）
+            if [ -n "$version_in_file" ]; then
+                # 最適化：1回の正規化で処理
+                CLEAN_VERSION="${version_in_file#[~^]}"
+                CLEAN_PART="${VERSION_PART#[~^]}"
+                
+                if [[ "$version_in_file" == "$VERSION_PART" ]] || [[ "$CLEAN_VERSION" == "$CLEAN_PART" ]]; then
+                    return 0  # true (suspicious)
+                fi
+            fi
+        done
+    fi
+    
+    return 1  # false (not suspicious)
+}
+
 # =====================================================
-# チェック1: package.jsonファイル内の疑わしいnpmパッケージ
+# チェック1: package.json・package-lock.jsonファイル内の疑わしいnpmパッケージ
 # =====================================================
-echo -e "${BLUE}[チェック1] package.jsonファイルの検査（バージョンチェック対応）${NC}"
+echo -e "${BLUE}[チェック1] package.json・package-lock.jsonファイルの検査（バージョンチェック対応）${NC}"
 echo "---------------------------------------------------"
 
 # 疑わしいパッケージリストを配列に読み込む（Bash 3.x互換）
@@ -171,82 +205,109 @@ done < "$PACKAGE_LIST_FILE"
 echo -e "読み込まれた疑わしいパッケージ数: ${YELLOW}${#SUSPICIOUS_PACKAGES_NAMES[@]}${NC}"
 echo ""
 
-# package.jsonファイルを検索（Bash 3.x互換）
+# package.jsonとpackage-lock.jsonファイルを検索（Bash 3.x互換）
 PACKAGE_JSON_ARRAY=()
+PACKAGE_LOCK_ARRAY=()
 OLD_IFS="$IFS"
 IFS=$'\n'
 PACKAGE_JSON_ARRAY=($(find "$SEARCH_PATH" -type f -name "package.json" 2>/dev/null))
+PACKAGE_LOCK_ARRAY=($(find "$SEARCH_PATH" -type f -name "package-lock.json" 2>/dev/null))
 IFS="$OLD_IFS"
 
-if [ ${#PACKAGE_JSON_ARRAY[@]} -eq 0 ]; then
-    echo -e "${GREEN}✓ package.jsonファイルが見つかりませんでした${NC}"
+TOTAL_FILES=$((${#PACKAGE_JSON_ARRAY[@]} + ${#PACKAGE_LOCK_ARRAY[@]}))
+
+if [ $TOTAL_FILES -eq 0 ]; then
+    echo -e "${GREEN}✓ package.json・package-lock.jsonファイルが見つかりませんでした${NC}"
 else
-    PACKAGE_JSON_COUNT=${#PACKAGE_JSON_ARRAY[@]}
-    echo -e "見つかったpackage.jsonファイル数: ${YELLOW}$PACKAGE_JSON_COUNT${NC}"
+    echo -e "見つかったファイル数: package.json=${YELLOW}${#PACKAGE_JSON_ARRAY[@]}${NC}個, package-lock.json=${YELLOW}${#PACKAGE_LOCK_ARRAY[@]}${NC}個"
     echo ""
     
-    # 最適化：各ファイルを1回だけ読んで全パッケージをチェック
-    for PKG_FILE in "${PACKAGE_JSON_ARRAY[@]}"; do
-        # ファイル内容を一度だけ読み込む
-        if [ -f "$PKG_FILE" ]; then
-            PKG_CONTENT=$(cat "$PKG_FILE" 2>/dev/null || echo "")
-            
-            # 全ての疑わしいパッケージをチェック
-            for i in "${!SUSPICIOUS_PACKAGES_NAMES[@]}"; do
-                PACKAGE_NAME="${SUSPICIOUS_PACKAGES_NAMES[$i]}"
-                VERSION_SPEC="${SUSPICIOUS_PACKAGES_VERSIONS[$i]}"
+    # package.jsonファイルのチェック
+    if [ ${#PACKAGE_JSON_ARRAY[@]} -gt 0 ]; then
+        echo -e "${BLUE}package.jsonファイルをチェック中...${NC}"
+        for PKG_FILE in "${PACKAGE_JSON_ARRAY[@]}"; do
+            # ファイル内容を一度だけ読み込む
+            if [ -f "$PKG_FILE" ]; then
+                PKG_CONTENT=$(cat "$PKG_FILE" 2>/dev/null || echo "")
                 
-                # 最適化：正規表現マッチングを使用（grep/sed/pipeの代わり）
-                if [[ "$PKG_CONTENT" =~ \"$PACKAGE_NAME\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
-                    VERSION_IN_FILE="${BASH_REMATCH[1]}"
+                # 全ての疑わしいパッケージをチェック
+                for i in "${!SUSPICIOUS_PACKAGES_NAMES[@]}"; do
+                    PACKAGE_NAME="${SUSPICIOUS_PACKAGES_NAMES[$i]}"
+                    VERSION_SPEC="${SUSPICIOUS_PACKAGES_VERSIONS[$i]}"
                     
-                    # バージョンチェック
-                    IS_SUSPICIOUS=false
-                    
-                    if [ -z "$VERSION_SPEC" ]; then
-                        # バージョン指定がない場合は、パッケージ名のみで判定
-                        IS_SUSPICIOUS=true
-                    else
-                        # バージョン仕様を解析（|| で区切られた複数バージョンに対応）
-                        IFS='||' read -ra VERSION_PARTS <<< "$VERSION_SPEC"
-                        for VERSION_PART in "${VERSION_PARTS[@]}"; do
-                            # 前後の空白と "= " を削除（最適化版）
-                            VERSION_PART=$(trim_whitespace "$VERSION_PART")
-                            VERSION_PART="${VERSION_PART#=}"
-                            VERSION_PART=$(trim_whitespace "$VERSION_PART")
-                            
-                            # バージョンが一致するかチェック（^や~などの範囲指定も考慮）
+                    # 最適化：正規表現マッチングを使用（grep/sed/pipeの代わり）
+                    if [[ "$PKG_CONTENT" =~ \"$PACKAGE_NAME\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+                        VERSION_IN_FILE="${BASH_REMATCH[1]}"
+                        
+                        # バージョンチェック（共通関数に移行）
+                        if check_suspicious_version "$PACKAGE_NAME" "$VERSION_IN_FILE" "$VERSION_SPEC"; then
+                            echo -e "${RED}[警告] 疑わしいパッケージが検出されました！${NC}"
+                            echo -e "  ファイル: ${YELLOW}$PKG_FILE${NC}"
+                            echo -e "  パッケージ: ${RED}$PACKAGE_NAME${NC}"
                             if [ -n "$VERSION_IN_FILE" ]; then
-                                # 最適化：1回の正規化で処理
-                                CLEAN_VERSION="${VERSION_IN_FILE#[~^]}"
-                                CLEAN_PART="${VERSION_PART#[~^]}"
-                                
-                                if [[ "$VERSION_IN_FILE" == "$VERSION_PART" ]] || [[ "$CLEAN_VERSION" == "$CLEAN_PART" ]]; then
-                                    IS_SUSPICIOUS=true
-                                    break
-                                fi
+                                echo -e "  検出バージョン: ${RED}$VERSION_IN_FILE${NC}"
                             fi
-                        done
+                            if [ -n "$VERSION_SPEC" ]; then
+                                echo -e "  疑わしいバージョン: ${RED}$VERSION_SPEC${NC}"
+                            fi
+                            echo ""
+                            ((MALWARE_COUNT++))
+                        fi
                     fi
+                done
+            fi
+        done
+    fi
+    
+    # package-lock.jsonファイルのチェック
+    if [ ${#PACKAGE_LOCK_ARRAY[@]} -gt 0 ]; then
+        echo -e "${BLUE}package-lock.jsonファイルをチェック中...${NC}"
+        for LOCK_FILE in "${PACKAGE_LOCK_ARRAY[@]}"; do
+            # ファイル内容を一度だけ読み込む
+            if [ -f "$LOCK_FILE" ]; then
+                LOCK_CONTENT=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+                
+                # 全ての疑わしいパッケージをチェック
+                for i in "${!SUSPICIOUS_PACKAGES_NAMES[@]}"; do
+                    PACKAGE_NAME="${SUSPICIOUS_PACKAGES_NAMES[$i]}"
+                    VERSION_SPEC="${SUSPICIOUS_PACKAGES_VERSIONS[$i]}"
                     
-                    if [ "$IS_SUSPICIOUS" = true ]; then
-                        echo -e "${RED}[警告] 疑わしいパッケージが検出されました！${NC}"
-                        echo -e "  ファイル: ${YELLOW}$PKG_FILE${NC}"
-                        echo -e "  パッケージ: ${RED}$PACKAGE_NAME${NC}"
-                        if [ -n "$VERSION_IN_FILE" ]; then
+                    # package-lock.jsonでは "packages" セクション内と "dependencies" セクション内をチェック
+                    # パターン1: "packages" セクション ("node_modules/パッケージ名": { "version": "x.y.z" })
+                    if [[ "$LOCK_CONTENT" =~ \"node_modules/$PACKAGE_NAME\"[[:space:]]*:[[:space:]]*\{[^}]*\"version\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+                        VERSION_IN_FILE="${BASH_REMATCH[1]}"
+                        
+                        if check_suspicious_version "$PACKAGE_NAME" "$VERSION_IN_FILE" "$VERSION_SPEC"; then
+                            echo -e "${RED}[警告] 疑わしいパッケージが検出されました！${NC}"
+                            echo -e "  ファイル: ${YELLOW}$LOCK_FILE${NC} (packagesセクション)"
+                            echo -e "  パッケージ: ${RED}$PACKAGE_NAME${NC}"
                             echo -e "  検出バージョン: ${RED}$VERSION_IN_FILE${NC}"
+                            if [ -n "$VERSION_SPEC" ]; then
+                                echo -e "  疑わしいバージョン: ${RED}$VERSION_SPEC${NC}"
+                            fi
+                            echo ""
+                            ((MALWARE_COUNT++))
                         fi
-                        if [ -n "$VERSION_SPEC" ]; then
-                            echo -e "  疑わしいバージョン: ${RED}$VERSION_SPEC${NC}"
+                    # パターン2: "dependencies" セクション ("パッケージ名": { "version": "x.y.z" })
+                    elif [[ "$LOCK_CONTENT" =~ \"$PACKAGE_NAME\"[[:space:]]*:[[:space:]]*\{[^}]*\"version\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+                        VERSION_IN_FILE="${BASH_REMATCH[1]}"
+                        
+                        if check_suspicious_version "$PACKAGE_NAME" "$VERSION_IN_FILE" "$VERSION_SPEC"; then
+                            echo -e "${RED}[警告] 疑わしいパッケージが検出されました！${NC}"
+                            echo -e "  ファイル: ${YELLOW}$LOCK_FILE${NC} (dependenciesセクション)"
+                            echo -e "  パッケージ: ${RED}$PACKAGE_NAME${NC}"
+                            echo -e "  検出バージョン: ${RED}$VERSION_IN_FILE${NC}"
+                            if [ -n "$VERSION_SPEC" ]; then
+                                echo -e "  疑わしいバージョン: ${RED}$VERSION_SPEC${NC}"
+                            fi
+                            echo ""
+                            ((MALWARE_COUNT++))
                         fi
-                        echo ""
-                        # カウントを増やす（最適化：ファイルI/Oの代わりに変数を使用）
-                        ((MALWARE_COUNT++))
                     fi
-                fi
-            done
-        fi
-    done
+                done
+            fi
+        done
+    fi
 fi
 
 echo ""

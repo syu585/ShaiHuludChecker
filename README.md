@@ -16,9 +16,10 @@
 
 このスクリプトは以下の2つのチェックを実行します：
 
-1. **package.jsonファイルのチェック**
-   - 指定されたパス内の全ての`package.json`ファイルを検索
+1. **package.json・package-lock.jsonファイルのチェック**
+   - 指定されたパス内の全ての`package.json`および`package-lock.json`ファイルを検索
    - 疑わしいnpmパッケージがインストールされているかを確認
+   - package-lock.jsonでは`packages`セクションと`dependencies`セクションの両方をチェック
 
 2. **疑わしいファイル・フォルダの検出**
    - `setup_bun.js`

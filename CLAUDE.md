@@ -44,7 +44,9 @@ bash -n malcheck.sh
 
 The malcheck.sh script performs two main checks:
 
-1. **Package.json scanning**: Recursively finds all package.json files and checks dependencies against the malware database
+1. **Package.json and package-lock.json scanning**: Recursively finds all package.json and package-lock.json files and checks dependencies against the malware database
+   - For package.json: Checks `dependencies` and `devDependencies` sections
+   - For package-lock.json: Checks both `packages` section (`node_modules/package-name`) and `dependencies` section
 2. **Suspicious file detection**: Looks for specific malware-related files:
    - `setup_bun.js`
    - `bun_environment.js` 
