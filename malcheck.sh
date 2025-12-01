@@ -167,6 +167,124 @@ fi
 echo ""
 
 # =====================================================
+# チェック1-2: lockファイル内の疑わしいnpmパッケージ
+# =====================================================
+echo -e "${BLUE}[チェック1-2] lockファイルの検査（バージョンチェック対応）${NC}"
+echo "---------------------------------------------------"
+
+# lockファイルを検索（package-lock.json, yarn.lock, pnpm-lock.yaml, bun.lockb, bun.lock）
+mapfile -t LOCK_FILES_ARRAY < <(find "$SEARCH_PATH" -type f \( -name "package-lock.json" -o -name "yarn.lock" -o -name "pnpm-lock.yaml" -o -name "bun.lockb" -o -name "bun.lock" \) 2>/dev/null)
+
+if [ ${#LOCK_FILES_ARRAY[@]} -eq 0 ]; then
+    echo -e "${GREEN}✓ lockファイルが見つかりませんでした${NC}"
+else
+    LOCK_FILES_COUNT=${#LOCK_FILES_ARRAY[@]}
+    echo -e "見つかったlockファイル数: ${YELLOW}$LOCK_FILES_COUNT${NC}"
+    echo ""
+    
+    # 各lockファイルをチェック
+    for LOCK_FILE in "${LOCK_FILES_ARRAY[@]}"; do
+        # ファイル内容を一度だけ読み込む
+        if [ -f "$LOCK_FILE" ]; then
+            LOCK_CONTENT=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+            LOCK_BASENAME=$(basename "$LOCK_FILE")
+            
+            # 全ての疑わしいパッケージをチェック
+            for PACKAGE_NAME in "${SUSPICIOUS_PACKAGES_NAMES[@]}"; do
+                # lockファイルの種類に応じて検索パターンを調整
+                VERSION_IN_FILE=""
+                PACKAGE_FOUND=false
+                
+                if [[ "$LOCK_BASENAME" == "package-lock.json" ]]; then
+                    # package-lock.json の場合: "パッケージ名": { "version": "x.x.x" }
+                    if [[ "$LOCK_CONTENT" =~ \"$PACKAGE_NAME\":[[:space:]]*\{[^}]*\"version\":[[:space:]]*\"([^\"]+)\" ]]; then
+                        VERSION_IN_FILE="${BASH_REMATCH[1]}"
+                        PACKAGE_FOUND=true
+                    fi
+                elif [[ "$LOCK_BASENAME" == "yarn.lock" ]]; then
+                    # yarn.lock の場合: パッケージ名@version:\n  version "x.x.x"
+                    if echo "$LOCK_CONTENT" | grep -q "^\"\\?$PACKAGE_NAME@" 2>/dev/null; then
+                        VERSION_IN_FILE=$(echo "$LOCK_CONTENT" | grep -A 5 "^\"\\?$PACKAGE_NAME@" | grep -m 1 "version" | sed 's/.*version "\([^"]*\)".*/\1/')
+                        PACKAGE_FOUND=true
+                    fi
+                elif [[ "$LOCK_BASENAME" == "pnpm-lock.yaml" ]]; then
+                    # pnpm-lock.yaml の場合: パッケージ名: x.x.x または パッケージ名@x.x.x
+                    if echo "$LOCK_CONTENT" | grep -q "'\\?$PACKAGE_NAME'\\?:" 2>/dev/null || echo "$LOCK_CONTENT" | grep -q "$PACKAGE_NAME@" 2>/dev/null; then
+                        VERSION_IN_FILE=$(echo "$LOCK_CONTENT" | grep -E "'?$PACKAGE_NAME'?:|$PACKAGE_NAME@" | head -n 1 | sed -E 's/.*[:|@][ ]?([0-9]+\.[0-9]+\.[0-9]+[^ ]*).*/\1/')
+                        PACKAGE_FOUND=true
+                    fi
+                elif [[ "$LOCK_BASENAME" == "bun.lockb" ]]; then
+                    # bun.lockb の場合（テキスト形式）: パッケージ名@version
+                    if echo "$LOCK_CONTENT" | grep -q "$PACKAGE_NAME@" 2>/dev/null; then
+                        VERSION_IN_FILE=$(echo "$LOCK_CONTENT" | grep -o "$PACKAGE_NAME@[0-9][^[:space:]]*" | head -n 1 | sed "s/$PACKAGE_NAME@//")
+                        PACKAGE_FOUND=true
+                    fi
+                elif [[ "$LOCK_BASENAME" == "bun.lock" ]]; then
+                    # bun.lock の場合（バイナリ形式）: 文字列検索でパッケージ名を検出
+                    # バイナリファイルなのでstringsコマンドを使用するか、grepでバイナリ検索
+                    if grep -a -q "$PACKAGE_NAME@" "$LOCK_FILE" 2>/dev/null; then
+                        # バージョン抽出はバイナリから難しいので、パッケージ名のみで検出
+                        VERSION_IN_FILE=$(grep -a -o "$PACKAGE_NAME@[0-9][^[:space:][:cntrl:]]*" "$LOCK_FILE" 2>/dev/null | head -n 1 | sed "s/$PACKAGE_NAME@//" | tr -d '\0')
+                        PACKAGE_FOUND=true
+                    fi
+                fi
+                
+                if [ "$PACKAGE_FOUND" = true ]; then
+                    # 疑わしいバージョン仕様を取得
+                    VERSION_SPEC="${SUSPICIOUS_PACKAGES_MAP[$PACKAGE_NAME]}"
+                    
+                    # バージョンチェック
+                    IS_SUSPICIOUS=false
+                    
+                    if [ -z "$VERSION_SPEC" ]; then
+                        # バージョン指定がない場合は、パッケージ名のみで判定
+                        IS_SUSPICIOUS=true
+                    else
+                        # バージョン仕様を解析（|| で区切られた複数バージョンに対応）
+                        IFS='||' read -ra VERSION_PARTS <<< "$VERSION_SPEC"
+                        for VERSION_PART in "${VERSION_PARTS[@]}"; do
+                            # 前後の空白と "= " を削除（最適化版）
+                            VERSION_PART=$(trim_whitespace "$VERSION_PART")
+                            VERSION_PART="${VERSION_PART#=}"
+                            VERSION_PART=$(trim_whitespace "$VERSION_PART")
+                            
+                            # バージョンが一致するかチェック
+                            if [ -n "$VERSION_IN_FILE" ]; then
+                                # 最適化：1回の正規化で処理
+                                CLEAN_VERSION="${VERSION_IN_FILE#[~^]}"
+                                CLEAN_PART="${VERSION_PART#[~^]}"
+                                
+                                if [[ "$VERSION_IN_FILE" == "$VERSION_PART" ]] || [[ "$CLEAN_VERSION" == "$CLEAN_PART" ]]; then
+                                    IS_SUSPICIOUS=true
+                                    break
+                                fi
+                            fi
+                        done
+                    fi
+                    
+                    if [ "$IS_SUSPICIOUS" = true ]; then
+                        echo -e "${RED}[警告] 疑わしいパッケージが検出されました！${NC}"
+                        echo -e "  ファイル: ${YELLOW}$LOCK_FILE${NC}"
+                        echo -e "  パッケージ: ${RED}$PACKAGE_NAME${NC}"
+                        if [ -n "$VERSION_IN_FILE" ]; then
+                            echo -e "  検出バージョン: ${RED}$VERSION_IN_FILE${NC}"
+                        fi
+                        if [ -n "$VERSION_SPEC" ]; then
+                            echo -e "  疑わしいバージョン: ${RED}$VERSION_SPEC${NC}"
+                        fi
+                        echo ""
+                        # カウントを増やす
+                        ((MALWARE_COUNT++))
+                    fi
+                fi
+            done
+        fi
+    done
+fi
+
+echo ""
+
+# =====================================================
 # チェック2: 疑わしいファイル・フォルダの存在確認
 # =====================================================
 echo -e "${BLUE}[チェック2] 疑わしいファイル・フォルダの検査${NC}"
