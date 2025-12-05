@@ -286,15 +286,19 @@ echo ""
 
 # =====================================================
 # チェック2: 疑わしいファイル・フォルダの存在確認
+# Based on: https://about.gitlab.com/blog/gitlab-discovers-widespread-npm-supply-chain-attack/#indicators-of-compromise
 # =====================================================
 echo -e "${BLUE}[チェック2] 疑わしいファイル・フォルダの検査${NC}"
 echo "---------------------------------------------------"
 
-# 検査対象のファイル・フォルダリスト
+# 検査対象のファイル・フォルダリスト（IoC from GitLab Security Research）
 SUSPICIOUS_ITEMS=(
-    "setup_bun.js"
-    "bun_environment.js"
-    ".dev-env"
+    "setup_bun.js"           # Malicious loader script
+    "bun_environment.js"     # Malicious post-install script in node_modules
+    ".dev-env"               # Suspicious dev environment
+    ".truffler-cache"        # Hidden directory for Trufflehog binary storage
+    "trufflehog"             # Downloaded Trufflehog binary (Linux/Mac)
+    "trufflehog.exe"         # Downloaded Trufflehog binary (Windows)
 )
 
 # 最適化：1回のfindで全アイテムを検索
@@ -344,6 +348,80 @@ else
     for ITEM in "${SUSPICIOUS_ITEMS[@]}"; do
         echo -e "${GREEN}✓ '$ITEM' は見つかりませんでした${NC}"
     done
+fi
+
+echo ""
+
+# ホームディレクトリの .truffler-cache も追加でチェック
+echo -e "${BLUE}[チェック2-2] ホームディレクトリの疑わしいファイル検査${NC}"
+echo "---------------------------------------------------"
+
+HOME_SUSPICIOUS_PATHS=(
+    "$HOME/.truffler-cache"
+    "$HOME/.truffler-cache/extract"
+    "$HOME/.truffler-cache/trufflehog"
+    "$HOME/.truffler-cache/trufflehog.exe"
+)
+
+HOME_ITEMS_FOUND=false
+for SUSPECT_PATH in "${HOME_SUSPICIOUS_PATHS[@]}"; do
+    if [ -e "$SUSPECT_PATH" ]; then
+        HOME_ITEMS_FOUND=true
+        echo -e "${RED}[警告] 疑わしいアイテムが検出されました！${NC}"
+        if [ -d "$SUSPECT_PATH" ]; then
+            echo -e "  場所: ${YELLOW}$SUSPECT_PATH${NC} ${RED}(ディレクトリ)${NC}"
+        else
+            echo -e "  場所: ${YELLOW}$SUSPECT_PATH${NC} ${RED}(ファイル)${NC}"
+        fi
+        echo ""
+        ((MALWARE_COUNT++))
+    fi
+done
+
+if [ "$HOME_ITEMS_FOUND" = false ]; then
+    echo -e "${GREEN}✓ ホームディレクトリに疑わしいファイルは見つかりませんでした${NC}"
+fi
+
+echo ""
+
+# =====================================================
+# チェック2-3: 疑わしいプロセスの検出
+# =====================================================
+echo -e "${BLUE}[チェック2-3] 疑わしいプロセスの検査${NC}"
+echo "---------------------------------------------------"
+
+# 疑わしいプロセスパターン（IoC from GitLab Security Research）
+SUSPICIOUS_PROCESS_PATTERNS=(
+    "shred -uvz"                      # Linux/Mac destructive payload
+    "del /F /Q /S"                    # Windows destructive payload
+    "cipher /W:"                      # Windows secure deletion
+    "curl -fsSL https://bun.sh"       # Suspicious Bun installation during npm install
+    "irm bun.sh/install.ps1"          # Windows Bun installation via PowerShell
+)
+
+PROCESS_FOUND=false
+
+# psコマンドでプロセスを検査
+if command -v ps &> /dev/null; then
+    PS_OUTPUT=$(ps aux 2>/dev/null || ps -ef 2>/dev/null || echo "")
+    
+    for PATTERN in "${SUSPICIOUS_PROCESS_PATTERNS[@]}"; do
+        if echo "$PS_OUTPUT" | grep -v "grep" | grep -q "$PATTERN" 2>/dev/null; then
+            PROCESS_FOUND=true
+            echo -e "${RED}[警告] 疑わしいプロセスが検出されました！${NC}"
+            echo -e "  パターン: ${RED}$PATTERN${NC}"
+            echo -e "  詳細:"
+            echo "$PS_OUTPUT" | grep -v "grep" | grep "$PATTERN" | while read -r line; do
+                echo -e "    ${YELLOW}$line${NC}"
+            done
+            echo ""
+            ((MALWARE_COUNT++))
+        fi
+    done
+fi
+
+if [ "$PROCESS_FOUND" = false ]; then
+    echo -e "${GREEN}✓ 疑わしいプロセスは見つかりませんでした${NC}"
 fi
 
 echo ""
